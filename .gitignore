@@ -3,3 +3,7 @@ src-tauri/target/
 src-tauri/gen/
 .DS_Store
 dist/
+
+# Signing keys live in ~/.sweep-signing, never in the repo.
+*.p12
+*.pem

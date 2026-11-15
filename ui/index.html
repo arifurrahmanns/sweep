@@ -7,62 +7,68 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <header class="titlebar" data-tauri-drag-region>
-    <div class="brand" data-tauri-drag-region>
-      <svg class="logo" viewBox="100 100 824 824" aria-hidden="true">
-        <defs>
-          <linearGradient id="logoBg" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0" stop-color="#38d0c4"/>
-            <stop offset="1" stop-color="#1563dd"/>
-          </linearGradient>
-        </defs>
-        <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#logoBg)"/>
-        <circle cx="512" cy="512" r="250" fill="none" stroke="#fff" stroke-opacity="0.28" stroke-width="64"/>
-        <circle cx="512" cy="512" r="250" fill="none" stroke="#fff" stroke-width="64" stroke-linecap="round" stroke-dasharray="1060 1571" transform="rotate(-90 512 512)"/>
-        <path d="M512 392 L543 481 L632 512 L543 543 L512 632 L481 543 L392 512 L481 481 Z" fill="#fff"/>
-      </svg>
-      <span data-tauri-drag-region>Sweep</span>
-    </div>
-    <div class="disk" data-tauri-drag-region>
-      <div class="disk-bar" data-tauri-drag-region><div class="disk-used" id="diskUsed"></div><div class="disk-selected" id="diskSelected"></div></div>
-      <div class="disk-label" id="diskLabel" data-tauri-drag-region></div>
-    </div>
-    <div class="actions">
-      <button class="ghost" id="foldersBtn" type="button">Folders</button>
-      <button class="primary" id="scanBtn" type="button">Scan</button>
-    </div>
-  </header>
-
-  <main id="main">
-    <section id="welcome" class="center">
-      <div class="hero">
-        <h1>Free up space</h1>
-        <p>Nothing is deleted until you confirm.</p>
-        <button class="primary large" id="welcomeScan" type="button">Scan</button>
-        <div id="accessNote" class="access-note" hidden>
-          <span>Allow Full Disk Access so macOS stops asking about each folder.</span>
-          <button class="ghost" data-fda type="button">Open Settings</button>
+  <!-- Before the first scan: just the disk and a Scan button. -->
+  <section id="start" class="start">
+    <header class="toolbar plain" data-tauri-drag-region>
+      <div class="tools">
+        <button class="tool" data-settings type="button" title="Settings (⌘,)" aria-label="Settings"></button>
+      </div>
+    </header>
+    <div class="start-body" data-tauri-drag-region>
+      <div class="gauge" id="gauge">
+        <svg viewBox="0 0 200 200" aria-hidden="true">
+          <defs>
+            <linearGradient id="gaugeFill" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#38d0c4"/>
+              <stop offset="1" stop-color="#1563dd"/>
+            </linearGradient>
+          </defs>
+          <circle class="gauge-track" cx="100" cy="100" r="86"/>
+          <circle class="gauge-used" id="gaugeUsed" cx="100" cy="100" r="86"/>
+        </svg>
+        <div class="gauge-label">
+          <strong id="gaugeFree"></strong>
+          <span id="gaugeOf"></span>
         </div>
       </div>
-    </section>
-
-    <section id="scanning" class="center" hidden>
-      <div class="hero">
-        <div class="spinner" aria-hidden="true"></div>
-        <p id="scanStep">Scanning</p>
+      <p class="scan-step" id="scanStep" hidden></p>
+      <button class="btn primary large" id="startScan" type="button">Scan</button>
+      <div id="accessNote" class="access-note" hidden>
+        <span>Full Disk Access is off</span>
+        <button class="btn small" data-fda type="button">Turn On…</button>
       </div>
-    </section>
+    </div>
+  </section>
 
-    <section id="results" hidden>
+  <!-- After a scan: sidebar of categories, list on the right. -->
+  <div id="app" class="app" hidden>
+    <aside class="sidebar">
+      <div class="sidebar-top" data-tauri-drag-region></div>
       <nav id="catList" aria-label="Categories"></nav>
-      <div id="catView"></div>
-    </section>
-  </main>
+      <div class="sidebar-foot">
+        <div id="skipped"></div>
+        <div class="storage" title="Startup disk">
+          <div class="disk-bar"><div class="disk-used" id="diskUsed"></div><div class="disk-selected" id="diskSelected"></div></div>
+          <div class="disk-label" id="diskLabel"></div>
+        </div>
+      </div>
+    </aside>
 
-  <footer id="footer" hidden>
-    <div id="selSummary"></div>
-    <button class="primary" id="cleanBtn" type="button" disabled>Clean up</button>
-  </footer>
+    <section class="content">
+      <header class="toolbar" id="toolbar" data-tauri-drag-region>
+        <h1 id="catTitle" data-tauri-drag-region></h1>
+        <div class="tools">
+          <button class="tool" id="rescanBtn" type="button" title="Scan Again (⌘R)" aria-label="Scan again"></button>
+          <button class="tool" data-settings type="button" title="Settings (⌘,)" aria-label="Settings"></button>
+        </div>
+      </header>
+      <div id="catView" class="scroll"></div>
+      <footer class="actionbar" id="actionbar">
+        <div id="selSummary"></div>
+        <button class="btn primary" id="cleanBtn" type="button" disabled>Clean Up</button>
+      </footer>
+    </section>
+  </div>
 
   <div id="modal" class="modal-backdrop" hidden>
     <div class="modal" role="dialog" aria-modal="true" id="modalBox"></div>

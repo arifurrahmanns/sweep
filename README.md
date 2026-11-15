@@ -25,9 +25,9 @@
 Get the latest `.dmg` from [Releases](https://github.com/arifurrahmanns/sweep/releases/latest), open it and drag Sweep to Applications. It runs on Apple silicon and Intel Macs.
 
 > [!NOTE]
-> Sweep isn't signed with an Apple Developer ID yet. The first time you open it, go to **System Settings → Privacy & Security** and click **Open Anyway**.
+> Sweep is signed with its own certificate, not an Apple Developer ID. The first time you open it, go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
-Give Sweep **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access) so it can scan Documents, Downloads and other apps' data without macOS asking about each folder. Without it, Sweep skips those places.
+Give Sweep **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access) so it can scan Documents, Downloads and other apps' data without macOS asking about each folder. Without it, Sweep skips those places. Every release is signed with the same certificate, so access stays on after updates.
 
 ## What it finds
 
@@ -68,7 +68,9 @@ npm version patch   # or minor, major
 git push --follow-tags
 ```
 
-GitHub Actions builds the app for Apple silicon and Intel and publishes it on the [Releases](https://github.com/arifurrahmanns/sweep/releases) page.
+GitHub Actions builds the app for Apple silicon and Intel, signs it and publishes it on the [Releases](https://github.com/arifurrahmanns/sweep/releases) page.
+
+Signing needs a one-time setup. Run `scripts/create-signing-cert.sh`, then add the two secrets it prints under **Settings → Secrets and variables → Actions**. To check signing without publishing, open the Release workflow on the Actions tab and click **Run workflow**.
 
 ## How it works
 
