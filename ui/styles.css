@@ -63,8 +63,13 @@ body {
   -webkit-font-smoothing: antialiased;
   user-select: none;
   -webkit-user-select: none;
+  -webkit-touch-callout: none;
   cursor: default;
 }
+
+/* Only text fields can be selected; nothing on the page can be dragged. */
+input { user-select: text; -webkit-user-select: text; }
+img, svg, a { -webkit-user-drag: none; }
 
 button {
   font: inherit;
@@ -308,8 +313,6 @@ footer {
   background: var(--info-bg);
   white-space: pre-wrap;
   word-break: break-all;
-  user-select: text;
-  -webkit-user-select: text;
 }
 
 .roots { list-style: none; margin: 10px 0; padding: 0; border: 1px solid var(--line); border-radius: 9px; }

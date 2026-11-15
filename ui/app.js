@@ -549,6 +549,31 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('modal').hidden && state.modalDismissable) closeModal();
 });
 
+// --------------------------------------------------------- native app feel
+
+// Behave like a Mac app, not a web page: no right-click menu (Reload,
+// Inspect Element, Look Up), no dragging bits of the page around, and no
+// browser shortcuts for reload, print, find, save, zoom or the inspector.
+const BROWSER_SHORTCUTS = new Set(['KeyR', 'KeyP', 'KeyF', 'KeyG', 'KeyS', 'KeyU', 'KeyO', 'Equal', 'Minus', 'Digit0', 'NumpadAdd', 'NumpadSubtract', 'Numpad0']);
+const INSPECTOR_SHORTCUTS = new Set(['KeyI', 'KeyJ', 'KeyC']);
+
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+document.addEventListener('dragstart', (e) => e.preventDefault());
+document.addEventListener(
+  'keydown',
+  (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    if (
+      ['F5', 'F7', 'F12'].includes(e.key) ||
+      (mod && BROWSER_SHORTCUTS.has(e.code)) ||
+      (mod && (e.altKey || e.shiftKey) && INSPECTOR_SHORTCUTS.has(e.code))
+    ) {
+      e.preventDefault();
+    }
+  },
+  true,
+);
+
 async function init() {
   try {
     const overview = await invoke('overview');
