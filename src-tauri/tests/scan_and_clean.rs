@@ -28,6 +28,7 @@ fn env_for(home: &Path, apps: &Path) -> Env {
         min_bytes: 1,
         now: now_secs(),
         check_processes: false,
+        full_disk_access: true,
     }
 }
 
@@ -215,4 +216,28 @@ fn guard_refuses_folders_that_link_outside_home() {
     fs::create_dir_all(outside.join("victim")).unwrap();
     std::os::unix::fs::symlink(&outside, f.home.join("link")).unwrap();
     assert!(check_target(&f.home, &f.home.join("link/victim")).is_err());
+}
+
+#[test]
+fn without_full_disk_access_protected_folders_are_skipped() {
+    let mut f = fixture();
+    write(&f.home.join("Documents/app/package.json"), 100);
+    write(&f.home.join("Documents/app/node_modules/x/index.js"), 10_000);
+
+    f.env.full_disk_access = false;
+    let result = scan(&f.env, &ScanOptions::default(), &|_: &str| {});
+    assert!(!result.full_disk_access);
+    assert!(items(&result, "installers").is_empty(), "Downloads is skipped");
+    let projects = items(&result, "projects");
+    assert!(find(&projects, "Documents/app/node_modules").is_none(), "Documents is skipped");
+    assert!(find(&projects, "old-site/node_modules").is_some(), "other folders are still scanned");
+    for place in ["Documents", "Downloads"] {
+        assert!(result.skipped.iter().any(|s| s == place), "{place} listed as skipped: {:?}", result.skipped);
+    }
+
+    f.env.full_disk_access = true;
+    let result = scan(&f.env, &ScanOptions::default(), &|_: &str| {});
+    assert!(result.skipped.is_empty());
+    assert!(find(&items(&result, "projects"), "Documents/app/node_modules").is_some());
+    assert!(!items(&result, "installers").is_empty());
 }

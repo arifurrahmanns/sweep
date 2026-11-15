@@ -35,7 +35,7 @@ pub enum Safety {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Remove(Vec<PathBuf>),
-    PnpmPrune { bin: PathBuf },
+    PnpmPrune { bin: PathBuf, store: PathBuf },
     DockerPrune { bin: PathBuf },
     /// Deletes Docker's disk image. Refused while Docker is running.
     DockerWipe { disk: PathBuf },
@@ -110,6 +110,10 @@ pub struct ScanResult {
     pub disk: DiskInfo,
     pub categories: Vec<Category>,
     pub scanned_at: i64,
+    /// False until the user gives Sweep Full Disk Access.
+    pub full_disk_access: bool,
+    /// Protected places skipped because Sweep lacks Full Disk Access.
+    pub skipped: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -136,6 +140,28 @@ impl Default for ScanOptions {
     }
 }
 
+/// Places macOS protects, relative to home. Without Full Disk Access,
+/// reading them makes macOS ask for permission (again and again for an
+/// unsigned app) or refuses outright, so Sweep skips them.
+const GUARDED: &[(&str, &str)] = &[
+    ("Desktop", "Desktop"),
+    ("Documents", "Documents"),
+    ("Downloads", "Downloads"),
+    ("Library/Mobile Documents", "iCloud Drive"),
+    ("Library/Containers", "other apps' data"),
+    ("Library/Group Containers", "other apps' data"),
+    ("Library/Mail", "Mail"),
+    ("Library/Application Support/MobileSync", "iPhone backups"),
+    (".Trash", "Trash"),
+];
+
+/// Whether Sweep has Full Disk Access. These checks never show a prompt:
+/// without access, macOS quietly refuses them.
+pub fn has_full_disk_access(home: &Path) -> bool {
+    fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok()
+        || fs::read_dir(home.join("Library/Safari")).is_ok()
+}
+
 /// Where to look. Tests point this at a temporary folder.
 pub struct Env {
     pub home: PathBuf,
@@ -148,6 +174,8 @@ pub struct Env {
     pub now: i64,
     /// Look at running processes (for Docker). Off in tests.
     pub check_processes: bool,
+    /// Sweep may read protected folders without macOS asking.
+    pub full_disk_access: bool,
 }
 
 pub fn now_secs() -> i64 {
@@ -187,6 +215,7 @@ impl Env {
         if let Ok(read) = fs::read_dir(home.join(".nvm/versions/node")) {
             bin_dirs.extend(read.flatten().map(|e| e.path().join("bin")));
         }
+        let full_disk_access = has_full_disk_access(&home);
         Env {
             home,
             app_dirs,
@@ -194,11 +223,30 @@ impl Env {
             min_bytes: 5 * MB,
             now: now_secs(),
             check_processes: true,
+            full_disk_access,
         }
     }
 
     fn at(&self, rel: &str) -> PathBuf {
         self.home.join(rel)
+    }
+
+    /// Whether Sweep can read `path` without macOS asking for permission.
+    pub fn can_read(&self, path: &Path) -> bool {
+        self.full_disk_access || !GUARDED.iter().any(|(rel, _)| path.starts_with(self.at(rel)))
+    }
+
+    /// Protected places that exist but are skipped for lack of access.
+    fn skipped_places(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if !self.full_disk_access {
+            for (rel, name) in GUARDED {
+                if self.at(rel).exists() && !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
     }
 
     pub fn find_bin(&self, name: &str) -> Option<PathBuf> {
@@ -309,6 +357,8 @@ pub fn scan(env: &Env, opts: &ScanOptions, progress: &(dyn Fn(&str) + Sync)) -> 
         disk: disk_info(),
         categories,
         scanned_at: env.now,
+        full_disk_access: env.full_disk_access,
+        skipped: env.skipped_places(),
     }
 }
 
@@ -588,14 +638,14 @@ fn pnpm_store(env: &Env) -> Option<Item> {
         "dev",
         "pnpm package store",
         "Runs `pnpm store prune`, which removes only unused packages",
-        vec![store],
+        vec![store.clone()],
         bytes,
         Safety::Safe,
     );
     item.id = "dev:pnpm-prune".to_string();
     item.approx = true;
     match env.find_bin("pnpm") {
-        Some(bin) => item.action = Action::PnpmPrune { bin },
+        Some(bin) => item.action = Action::PnpmPrune { bin, store },
         None => {
             item.enabled = false;
             item.preselect = false;
@@ -730,7 +780,7 @@ fn scan_projects(env: &Env, opts: &ScanOptions) -> Vec<Item> {
         opts.project_roots
             .iter()
             .map(PathBuf::from)
-            .filter(|p| p.starts_with(&env.home) && p.is_dir())
+            .filter(|p| p.starts_with(&env.home) && env.can_read(p) && p.is_dir())
             .collect()
     };
     roots.sort();
@@ -812,6 +862,9 @@ fn find_artifacts(env: &Env, dir: &Path, depth: usize) -> Vec<(PathBuf, &'static
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
+        if !env.can_read(&path) {
+            continue;
+        }
         let artifact = ARTIFACTS
             .iter()
             .find(|a| a.dir == name && a.markers.iter().any(|m| dir.join(m).is_file()));
@@ -901,7 +954,7 @@ fn scan_leftovers(env: &Env) -> Vec<Item> {
                 .paths
                 .iter()
                 .map(|rel| env.at(rel))
-                .filter(|p| fs::symlink_metadata(p).is_ok())
+                .filter(|p| env.can_read(p) && fs::symlink_metadata(p).is_ok())
                 .collect();
             let bytes: u64 = paths.iter().map(|p| disk_usage(p)).sum();
             if paths.is_empty() || bytes < env.min_bytes {
@@ -931,6 +984,9 @@ const PLATFORM_WORDS: &[&str] = &[
 
 fn scan_installers(env: &Env) -> Vec<Item> {
     let downloads = env.at("Downloads");
+    if !env.can_read(&downloads) {
+        return Vec::new();
+    }
     let apps = env.installed_apps();
     let mut items = Vec::new();
     for path in children(&downloads) {
@@ -1049,7 +1105,7 @@ fn is_intel_build(lower_name: &str) -> bool {
 
 fn scan_docker(env: &Env) -> Vec<Item> {
     let disk = env.at("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
-    if !disk.is_file() {
+    if !env.can_read(&disk) || !disk.is_file() {
         return Vec::new();
     }
     let bytes = disk_usage(&disk);
@@ -1143,6 +1199,9 @@ fn scan_manual(env: &Env) -> Vec<Item> {
         .par_iter()
         .filter_map(|(rel, title, tip)| {
             let path = env.at(rel);
+            if !env.can_read(&path) {
+                return None;
+            }
             fs::symlink_metadata(&path).ok()?;
             let readable = fs::read_dir(&path).is_ok();
             let bytes = if readable { disk_usage(&path) } else { 0 };

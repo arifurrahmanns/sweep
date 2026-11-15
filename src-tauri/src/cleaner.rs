@@ -25,6 +25,8 @@ pub struct Outcome {
     /// What the user can do about a failure. A second line, if any, is a
     /// Terminal command.
     pub hint: Option<String>,
+    /// Files are owned by root; `take_ownership` can fix that.
+    pub needs_admin: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -78,6 +80,7 @@ fn clean_item(env: &Env, item: &Item) -> Outcome {
         partial: false,
         message: None,
         hint: None,
+        needs_admin: false,
     };
     let fail = |mut out: Outcome, message: String| {
         out.ok = false;
@@ -111,7 +114,12 @@ fn clean_item(env: &Env, item: &Item) -> Outcome {
             remove_tree(disk, &stats);
             stats.describe(&mut out, disk);
         }
-        Action::PnpmPrune { bin } => run_tool(env, bin, &["store", "prune"], &mut out),
+        Action::PnpmPrune { bin, store } => {
+            // Point pnpm at the store; on its own it may pick one next to
+            // the working folder.
+            let store = store.display().to_string();
+            run_tool(env, bin, &["store", "prune", "--store-dir", &store], &mut out)
+        }
         Action::DockerPrune { bin } => run_tool(env, bin, &["system", "prune", "-a", "-f"], &mut out),
         Action::Nothing => return fail(out, "Sweep doesn't delete this.".to_string()),
     }
@@ -226,11 +234,9 @@ impl RemoveStats {
         out.partial = root.exists();
         let files = if failed == 1 { "1 file".to_string() } else { format!("{failed} files") };
         out.message = Some(format!("{files} couldn't be deleted."));
-        out.hint = if self.not_owned.load(Ordering::Relaxed) > 0 {
-            Some(format!(
-                "Some files are owned by root, usually from an old sudo. Run this in Terminal, then clean again:\nsudo chown -R \"$USER\" \"{}\"",
-                root.display()
-            ))
+        out.needs_admin = self.not_owned.load(Ordering::Relaxed) > 0;
+        out.hint = if out.needs_admin {
+            Some("They're owned by the system (root), usually from an old sudo command.".to_string())
         } else if self.blocked.load(Ordering::Relaxed) > 0 {
             Some("macOS blocked access. Quit the app using these files, or give Sweep Full Disk Access.".to_string())
         } else {
@@ -276,7 +282,13 @@ fn run_tool(env: &Env, bin: &Path, args: &[&str], out: &mut Outcome) {
             .rfind(|l| !l.is_empty())
             .map(str::to_string)
     };
-    match Command::new(bin).args(args).env("PATH", env.search_path()).output() {
+    // Apps opened from Finder start in "/", which is read-only.
+    let result = Command::new(bin)
+        .args(args)
+        .current_dir(&env.home)
+        .env("PATH", env.search_path())
+        .output();
+    match result {
         Ok(result) if result.status.success() => out.message = last_line(&result.stdout),
         Ok(result) => {
             out.ok = false;
@@ -288,5 +300,44 @@ fn run_tool(env: &Env, bin: &Path, args: &[&str], out: &mut Outcome) {
             out.ok = false;
             out.message = Some(format!("Couldn't run {}: {err}", bin.display()));
         }
+    }
+}
+
+/// Makes the user's account the owner of an item's files again, through the
+/// standard macOS admin password prompt. An ordinary app can't delete files
+/// that an old `sudo` left owned by root; after this it can.
+pub fn take_ownership(env: &Env, item: &Item) -> Result<(), String> {
+    let Action::Remove(paths) = &item.action else {
+        return Err("This item can't be fixed this way.".to_string());
+    };
+    for path in paths {
+        check_target(&env.home, path)?;
+    }
+    // SAFETY: getuid and getgid can't fail.
+    let owner = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
+    // Paths are passed as arguments, never pasted into the script.
+    let script = [
+        "on run argv",
+        "set targets to \"\"",
+        "repeat with p in rest of argv",
+        "set targets to targets & \" \" & quoted form of (p as text)",
+        "end repeat",
+        "do shell script \"/usr/sbin/chown -R \" & item 1 of argv & targets with prompt \"Sweep needs your password to delete files owned by the system.\" with administrator privileges",
+        "end run",
+    ];
+    let output = Command::new("/usr/bin/osascript")
+        .args(script.iter().flat_map(|line| ["-e", *line]))
+        .arg(&owner)
+        .args(paths)
+        .output()
+        .map_err(|e| format!("Couldn't ask for your password: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let error = String::from_utf8_lossy(&output.stderr);
+    if error.contains("-128") {
+        Err("Cancelled.".to_string())
+    } else {
+        Err(error.trim().to_string())
     }
 }

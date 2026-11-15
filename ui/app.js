@@ -21,6 +21,7 @@ const state = {
   active: null,
   busy: false,
   modalDismissable: true,
+  fullDiskAccess: true,
   settings: loadSettings(),
 };
 
@@ -142,6 +143,7 @@ function show(view) {
 }
 
 function renderAll() {
+  renderAccess();
   renderDisk();
   renderNav();
   renderCategory();
@@ -160,6 +162,20 @@ function renderDisk() {
   $('diskLabel').innerHTML = `<strong>${formatBytes(disk.free)} free</strong> of ${formatBytes(disk.total)}`;
 }
 
+function renderAccess() {
+  $('accessNote').hidden = state.fullDiskAccess;
+}
+
+/** Protected folders the last scan skipped for lack of Full Disk Access. */
+function skippedHtml() {
+  const skipped = state.result.skipped || [];
+  if (!skipped.length) return '';
+  const list = skipped.length > 1 ? `${skipped.slice(0, -1).join(', ')} and ${skipped[skipped.length - 1]}` : skipped[0];
+  return state.fullDiskAccess
+    ? `<div class="skipped">Full Disk Access is on. Scan again to include ${esc(list)}.</div>`
+    : `<div class="skipped">Skipped ${esc(list)}.<button class="link" data-fda type="button">Allow Full Disk Access</button></div>`;
+}
+
 function renderNav() {
   $('catList').innerHTML = state.result.categories
     .map((cat) => {
@@ -171,7 +187,7 @@ function renderNav() {
           ${chosen.length ? `<span class="cat-sub">${formatBytes(uniqueBytes(chosen))} selected</span>` : ''}
         </button>`;
     })
-    .join('');
+    .join('') + skippedHtml();
 }
 
 function renderCategory() {
@@ -297,6 +313,7 @@ function applyScan(result) {
   state.result = result;
   state.home = result.home;
   state.disk = result.disk;
+  state.fullDiskAccess = result.fullDiskAccess;
   state.items = new Map();
   state.selected = new Set();
   for (const cat of result.categories) {
@@ -405,11 +422,34 @@ function issueHtml(outcome) {
       hint += `<div class="cmd"><pre>${esc(cmd)}</pre><button class="ghost" data-copy="${esc(cmd)}" type="button">Copy</button></div>`;
     }
     if (text.includes('Full Disk Access')) {
-      hint += '<div class="cmd"><button class="ghost" data-fda type="button">Open settings</button></div>';
+      hint += '<div class="cmd"><button class="ghost" data-fda type="button">Open Settings</button></div>';
     }
+  }
+  if (outcome.needsAdmin) {
+    hint += `<div class="cmd"><button class="primary" data-fix="${esc(outcome.id)}" type="button">Fix with password</button></div>`;
   }
   return `<div class="issue"><div class="title">${esc(outcome.title)}</div>
     ${outcome.message ? `<div class="msg">${esc(outcome.message)}</div>` : ''}${hint}</div>`;
+}
+
+/** Takes back root-owned files (macOS asks for the password) and cleans again. */
+async function fixItem(button) {
+  const id = button.dataset.fix;
+  const title = (state.items.get(id) || {}).title || '';
+  button.disabled = true;
+  button.textContent = 'Waiting for password…';
+  let html;
+  try {
+    const report = await invoke('fix_and_clean', { id });
+    applyReport(report);
+    const outcome = report.outcomes[0];
+    html = outcome.ok
+      ? `<div class="issue"><div class="title">${esc(outcome.title)}</div><div class="msg ok">Deleted. ${formatBytes(report.diskAfter.free)} free now.</div></div>`
+      : issueHtml(outcome);
+  } catch (err) {
+    html = issueHtml({ id, title, needsAdmin: true, message: String(err) });
+  }
+  button.closest('.issue').outerHTML = html;
 }
 
 // ----------------------------------------------------------------- folders
@@ -535,8 +575,9 @@ $('modal').addEventListener('click', (e) => {
     );
     return;
   }
-  if (e.target.closest('[data-fda]')) {
-    invoke('open_full_disk_access').catch((err) => showError("Couldn't open Settings", err));
+  const fix = e.target.closest('[data-fix]');
+  if (fix) {
+    fixItem(fix);
     return;
   }
   if (e.target.closest('[data-rescan]')) {
@@ -547,6 +588,26 @@ $('modal').addEventListener('click', (e) => {
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('modal').hidden && state.modalDismissable) closeModal();
+});
+
+// "Allow Full Disk Access" buttons anywhere in the window.
+document.addEventListener('click', (e) => {
+  if (e.target.closest('[data-fda]')) {
+    invoke('open_full_disk_access').catch((err) => showError("Couldn't open Settings", err));
+  }
+});
+
+// Notice when the user comes back from turning on Full Disk Access.
+window.addEventListener('focus', async () => {
+  try {
+    const { fullDiskAccess } = await invoke('overview');
+    if (fullDiskAccess === state.fullDiskAccess) return;
+    state.fullDiskAccess = fullDiskAccess;
+    renderAccess();
+    if (state.result) renderNav();
+  } catch {
+    // Keep the last known state.
+  }
 });
 
 // --------------------------------------------------------- native app feel
@@ -579,7 +640,9 @@ async function init() {
     const overview = await invoke('overview');
     state.home = overview.home;
     state.disk = overview.disk;
+    state.fullDiskAccess = overview.fullDiskAccess;
     renderDisk();
+    renderAccess();
   } catch {
     $('diskLabel').textContent = '';
   }

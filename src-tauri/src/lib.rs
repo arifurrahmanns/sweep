@@ -26,13 +26,16 @@ struct AppState {
 struct Overview {
     home: String,
     disk: disk::DiskInfo,
+    full_disk_access: bool,
 }
 
 #[tauri::command]
 fn overview() -> Overview {
+    let env = Env::system();
     Overview {
-        home: Env::system().home.display().to_string(),
+        home: env.home.display().to_string(),
         disk: disk::disk_info(),
+        full_disk_access: env.full_disk_access,
     }
 }
 
@@ -84,6 +87,27 @@ async fn clean(app: AppHandle, state: State<'_, AppState>, ids: Vec<String>) -> 
     Ok(report)
 }
 
+/// Takes back ownership of root-owned files in an item (macOS asks for the
+/// admin password), then cleans it again.
+#[tauri::command]
+async fn fix_and_clean(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<cleaner::CleanReport, String> {
+    let item = state.items.lock().unwrap().get(&id).cloned();
+    let item = item.ok_or("Scan again, then try this.")?;
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let env = Env::system();
+        cleaner::take_ownership(&env, &item)?;
+        Ok::<_, String>(cleaner::clean(&env, &[item], &|progress| {
+            let _ = app.emit("clean-progress", progress);
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if report.outcomes.iter().all(|o| o.ok) {
+        state.items.lock().unwrap().remove(&id);
+    }
+    Ok(report)
+}
+
 /// Shows an item in Finder.
 #[tauri::command]
 fn reveal(state: State<'_, AppState>, id: String) -> Result<(), String> {
@@ -120,6 +144,7 @@ pub fn run() {
             overview,
             scan,
             clean,
+            fix_and_clean,
             reveal,
             open_full_disk_access
         ])

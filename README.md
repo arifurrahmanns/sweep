@@ -27,6 +27,8 @@ Get the latest `.dmg` from [Releases](https://github.com/arifurrahmanns/sweep/re
 > [!NOTE]
 > Sweep isn't signed with an Apple Developer ID yet. The first time you open it, go to **System Settings → Privacy & Security** and click **Open Anyway**.
 
+Give Sweep **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access) so it can scan Documents, Downloads and other apps' data without macOS asking about each folder. Without it, Sweep skips those places.
+
 ## What it finds
 
 | | |
