@@ -1,0 +1,53 @@
+name: Release
+
+# Runs when a version tag like v0.2.0 is pushed (see "Release" in the README).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Check tag matches version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match package.json version $version"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # One app that runs on both Apple silicon and Intel Macs.
+      - name: Build
+        run: npm run build -- --target universal-apple-darwin
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Download the `.dmg`, open it and drag Sweep to Applications.
+
+            The app isn't signed. The first time you open it, go to System Settings → Privacy & Security and click **Open Anyway**.
