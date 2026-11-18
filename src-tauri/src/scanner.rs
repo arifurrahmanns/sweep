@@ -1,17 +1,21 @@
 //! Finds files that can go without affecting your work.
 //!
 //! Scanning only reads the disk. Deleting happens in `cleaner`, and only for
-//! items a scan produced.
+//! items a scan produced. macOS and Windows keep things in different places;
+//! the Windows layout lives in `scanner/windows.rs`.
+
+mod windows;
 
 use crate::disk::{disk_info, DiskInfo};
-use crate::registry::KNOWN_APPS;
+use crate::os::{command, Os};
+use crate::registry::{known_apps, KnownApp};
 use crate::sizes::{disk_usage, newest_file_mtime, path_mtime};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MB: u64 = 1_000_000;
@@ -39,6 +43,9 @@ pub enum Action {
     DockerPrune { bin: PathBuf },
     /// Deletes Docker's disk image. Refused while Docker is running.
     DockerWipe { disk: PathBuf },
+    /// Deletes what's in a folder that hasn't changed since `older_than`,
+    /// keeping the folder itself (Windows' Temp folder).
+    EmptyFolder { dir: PathBuf, older_than: i64 },
     Nothing,
 }
 
@@ -164,17 +171,21 @@ pub fn has_full_disk_access(home: &Path) -> bool {
 
 /// Where to look. Tests point this at a temporary folder.
 pub struct Env {
+    /// Whose folder layout to scan.
+    pub os: Os,
     pub home: PathBuf,
-    /// Folders that hold installed apps.
+    /// Folders that hold installed apps. On Windows also Start menu folders.
     pub app_dirs: Vec<PathBuf>,
     /// Folders searched for command-line tools.
     pub bin_dirs: Vec<PathBuf>,
     /// Items smaller than this aren't worth listing.
     pub min_bytes: u64,
     pub now: i64,
-    /// Look at running processes (for Docker). Off in tests.
+    /// Ask the system about running processes (for Docker) and, on Windows,
+    /// installed programs. Off in tests.
     pub check_processes: bool,
-    /// Sweep may read protected folders without macOS asking.
+    /// Sweep may read protected folders without macOS asking. Always true on
+    /// Windows, which has no such protection.
     pub full_disk_access: bool,
 }
 
@@ -185,8 +196,22 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// `base` joined with a relative path written with `/`, using the system's
+/// own separator.
+pub fn join_rel(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/').filter(|part| !part.is_empty()).fold(base.to_path_buf(), |path, part| path.join(part))
+}
+
 impl Env {
+    /// The real system Sweep is running on.
     pub fn system() -> Env {
+        match Os::current() {
+            Os::Mac => Env::mac_system(),
+            Os::Windows => windows::system_env(),
+        }
+    }
+
+    fn mac_system() -> Env {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
@@ -217,6 +242,7 @@ impl Env {
         }
         let full_disk_access = has_full_disk_access(&home);
         Env {
+            os: Os::Mac,
             home,
             app_dirs,
             bin_dirs,
@@ -227,19 +253,20 @@ impl Env {
         }
     }
 
-    fn at(&self, rel: &str) -> PathBuf {
-        self.home.join(rel)
+    /// A path inside the home folder, written with `/`.
+    pub fn at(&self, rel: &str) -> PathBuf {
+        join_rel(&self.home, rel)
     }
 
     /// Whether Sweep can read `path` without macOS asking for permission.
     pub fn can_read(&self, path: &Path) -> bool {
-        self.full_disk_access || !GUARDED.iter().any(|(rel, _)| path.starts_with(self.at(rel)))
+        self.os != Os::Mac || self.full_disk_access || !GUARDED.iter().any(|(rel, _)| path.starts_with(self.at(rel)))
     }
 
     /// Protected places that exist but are skipped for lack of access.
     fn skipped_places(&self) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        if !self.full_disk_access {
+        if self.os == Os::Mac && !self.full_disk_access {
             for (rel, name) in GUARDED {
                 if self.at(rel).exists() && !names.iter().any(|n| n == name) {
                     names.push(name.to_string());
@@ -249,17 +276,22 @@ impl Env {
         names
     }
 
+    /// A command-line tool. On Windows tools end in .exe, or .cmd for ones
+    /// installed with npm.
     pub fn find_bin(&self, name: &str) -> Option<PathBuf> {
+        let names: Vec<String> = match self.os {
+            Os::Mac => vec![name.to_string()],
+            Os::Windows => ["exe", "cmd", "bat"].iter().map(|ext| format!("{name}.{ext}")).collect(),
+        };
         self.bin_dirs
             .iter()
-            .map(|dir| dir.join(name))
+            .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
             .find(|path| path.is_file())
     }
 
     /// PATH for tools Sweep runs, so scripts like pnpm can find node.
-    pub fn search_path(&self) -> String {
-        let dirs: Vec<String> = self.bin_dirs.iter().map(|d| d.display().to_string()).collect();
-        dirs.join(":")
+    pub fn search_path(&self) -> OsString {
+        std::env::join_paths(&self.bin_dirs).unwrap_or_default()
     }
 
     fn app_installed(&self, bundle: &str) -> bool {
@@ -268,6 +300,9 @@ impl Env {
 
     /// Installed apps as (display name, normalized name).
     fn installed_apps(&self) -> Vec<(String, String)> {
+        if self.os == Os::Windows {
+            return windows::installed_names(self);
+        }
         let mut apps = Vec::new();
         for dir in &self.app_dirs {
             let Ok(read) = fs::read_dir(dir) else { continue };
@@ -289,7 +324,7 @@ impl Env {
     fn tilde(&self, path: &Path) -> String {
         match path.strip_prefix(&self.home) {
             Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
-            Ok(rel) => format!("~/{}", rel.display()),
+            Ok(rel) => format!("~{}{}", std::path::MAIN_SEPARATOR, rel.display()),
             Err(_) => path.display().to_string(),
         }
     }
@@ -298,7 +333,10 @@ impl Env {
 /// Scans everything. `progress` receives a short note before each step.
 pub fn scan(env: &Env, opts: &ScanOptions, progress: &(dyn Fn(&str) + Sync)) -> ScanResult {
     progress("Measuring app caches");
-    let caches = scan_app_caches(env);
+    let caches = match env.os {
+        Os::Mac => scan_app_caches(env),
+        Os::Windows => windows::app_caches(env),
+    };
     progress("Measuring developer caches");
     let dev = scan_dev_caches(env);
     progress("Looking for build folders in your projects");
@@ -308,9 +346,15 @@ pub fn scan(env: &Env, opts: &ScanOptions, progress: &(dyn Fn(&str) + Sync)) -> 
     progress("Checking installers in Downloads");
     let installers = scan_installers(env);
     progress("Checking Docker");
-    let docker = scan_docker(env);
+    let docker = match env.os {
+        Os::Mac => scan_docker(env),
+        Os::Windows => windows::docker(env),
+    };
     progress("Checking other large folders");
-    let manual = scan_manual(env);
+    let manual = match env.os {
+        Os::Mac => scan_manual(env),
+        Os::Windows => windows::manual(env),
+    };
 
     let mut categories = vec![
         Category {
@@ -459,7 +503,7 @@ struct DevCache {
     safety: Safety,
 }
 
-const DEV_CACHES: &[DevCache] = &[
+const DEV_CACHES_MAC: &[DevCache] = &[
     DevCache {
         rel: ".npm/_cacache",
         title: "npm download cache",
@@ -553,7 +597,11 @@ const DEV_CACHES: &[DevCache] = &[
 ];
 
 fn scan_dev_caches(env: &Env) -> Vec<Item> {
-    let mut items: Vec<Item> = DEV_CACHES
+    let table = match env.os {
+        Os::Mac => DEV_CACHES_MAC,
+        Os::Windows => windows::DEV_CACHES,
+    };
+    let mut items: Vec<Item> = table
         .par_iter()
         .filter_map(|cache| {
             let path = env.at(cache.rel);
@@ -626,7 +674,11 @@ fn codex_install_leftovers(env: &Env) -> Option<Item> {
 }
 
 fn pnpm_store(env: &Env) -> Option<Item> {
-    let store = ["Library/pnpm/store", ".local/share/pnpm/store", ".pnpm-store"]
+    let places: &[&str] = match env.os {
+        Os::Mac => &["Library/pnpm/store", ".local/share/pnpm/store", ".pnpm-store"],
+        Os::Windows => &["AppData/Local/pnpm/store", ".pnpm-store"],
+    };
+    let store = places
         .iter()
         .map(|rel| env.at(rel))
         .find(|path| path.is_dir())?;
@@ -669,6 +721,7 @@ struct Artifact {
 }
 
 const PYTHON_MARKERS: &[&str] = &["requirements.txt", "pyproject.toml", "Pipfile", "setup.py"];
+const DOTNET_MARKERS: &[&str] = &["*.csproj", "*.fsproj", "*.vbproj"];
 
 const ARTIFACTS: &[Artifact] = &[
     Artifact {
@@ -753,6 +806,20 @@ const ARTIFACTS: &[Artifact] = &[
         markers: &["build.gradle", "build.gradle.kts"],
         label: "Gradle build",
         restore: "./gradlew build",
+        safety: Safety::Safe,
+    },
+    Artifact {
+        dir: "bin",
+        markers: DOTNET_MARKERS,
+        label: ".NET build",
+        restore: "dotnet build",
+        safety: Safety::Safe,
+    },
+    Artifact {
+        dir: "obj",
+        markers: DOTNET_MARKERS,
+        label: ".NET intermediate files",
+        restore: "dotnet build",
         safety: Safety::Safe,
     },
     Artifact {
@@ -867,7 +934,7 @@ fn find_artifacts(env: &Env, dir: &Path, depth: usize) -> Vec<(PathBuf, &'static
         }
         let artifact = ARTIFACTS
             .iter()
-            .find(|a| a.dir == name && a.markers.iter().any(|m| dir.join(m).is_file()));
+            .find(|a| a.dir == name && a.markers.iter().any(|m| has_marker(dir, m)));
         if let Some(art) = artifact {
             found.push((path, art));
             continue; // never look inside build folders
@@ -890,6 +957,17 @@ fn find_artifacts(env: &Env, dir: &Path, depth: usize) -> Vec<(PathBuf, &'static
             .collect::<Vec<_>>(),
     );
     found
+}
+
+/// Whether `dir` has a marker file. `*.csproj` means any file with that
+/// extension.
+fn has_marker(dir: &Path, marker: &str) -> bool {
+    match marker.strip_prefix("*.") {
+        Some(ext) => children(dir).iter().any(|path| {
+            path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) && path.is_file()
+        }),
+        None => dir.join(marker).is_file(),
+    }
 }
 
 /// The project a build folder belongs to: the nearest enclosing git
@@ -933,21 +1011,27 @@ fn is_bundle(name: &str) -> bool {
     .any(|ext| name.ends_with(ext))
 }
 
+/// Folders in the home folder that hold no projects, only personal media or
+/// system data.
 fn is_private_home_folder(env: &Env, path: &Path) -> bool {
-    ["Library", "Applications", "Music", "Movies", "Pictures", "Public"]
-        .iter()
-        .any(|rel| path == env.at(rel))
+    let names: &[&str] = match env.os {
+        Os::Mac => &["Library", "Applications", "Music", "Movies", "Pictures", "Public"],
+        Os::Windows => windows::PRIVATE_HOME_FOLDERS,
+    };
+    names.iter().any(|rel| path == env.at(rel))
 }
 
 // ------------------------------------------------------------ leftovers
 
 fn scan_leftovers(env: &Env) -> Vec<Item> {
-    KNOWN_APPS
+    let installed_names = match env.os {
+        Os::Mac => Vec::new(),
+        Os::Windows => env.installed_apps(),
+    };
+    known_apps(env.os)
         .par_iter()
         .filter_map(|app| {
-            let installed = app.bundles.iter().any(|b| env.app_installed(b))
-                || app.clis.iter().any(|c| env.find_bin(c).is_some());
-            if installed {
+            if app_is_installed(env, app, &installed_names) {
                 return None;
             }
             let paths: Vec<PathBuf> = app
@@ -972,17 +1056,32 @@ fn scan_leftovers(env: &Env) -> Vec<Item> {
         .collect()
 }
 
+/// Whether an app from the known-apps list is still installed. Errs on the
+/// side of "installed": a mistake there only means less gets listed.
+fn app_is_installed(env: &Env, app: &KnownApp, installed_names: &[(String, String)]) -> bool {
+    let found = match env.os {
+        Os::Mac => app.installs.iter().any(|bundle| env.app_installed(bundle)),
+        Os::Windows => windows::app_installed(env, app, installed_names),
+    };
+    found || app.clis.iter().any(|c| env.find_bin(c).is_some())
+}
+
 // ----------------------------------------------------------- installers
 
-const INSTALLER_EXTS: &[&str] = &["dmg", "pkg", "mpkg", "iso", "xip"];
+const INSTALLER_EXTS_MAC: &[&str] = &["dmg", "pkg", "mpkg", "iso", "xip"];
+const INSTALLER_EXTS_WINDOWS: &[&str] = &["exe", "msi", "msix", "msixbundle", "appx", "appxbundle", "iso"];
 const ARCHIVE_EXTS: &[&str] = &["zip", "tgz", "gz", "xz", "bz2", "7z", "rar", "tar"];
 const PLATFORM_WORDS: &[&str] = &[
     "mac", "macos", "osx", "darwin", "universal", "arm64", "aarch64", "x64", "x86", "intel",
     "apple", "silicon", "installer", "setup", "release", "latest", "stable", "beta", "education",
-    "signed", "full",
+    "signed", "full", "win", "windows", "win64", "win32", "amd64", "msvc", "user", "system",
 ];
 
 fn scan_installers(env: &Env) -> Vec<Item> {
+    let installer_exts = match env.os {
+        Os::Mac => INSTALLER_EXTS_MAC,
+        Os::Windows => INSTALLER_EXTS_WINDOWS,
+    };
     let downloads = env.at("Downloads");
     if !env.can_read(&downloads) {
         return Vec::new();
@@ -996,7 +1095,7 @@ fn scan_installers(env: &Env) -> Vec<Item> {
         }
         let name = name_of(&path);
         let ext = name.rsplit('.').next().unwrap_or_default().to_lowercase();
-        let is_installer = INSTALLER_EXTS.contains(&ext.as_str());
+        let is_installer = installer_exts.contains(&ext.as_str());
         let is_archive = ARCHIVE_EXTS.contains(&ext.as_str());
         let bytes = disk_usage(&path);
         let big_enough = if is_installer {
@@ -1017,7 +1116,8 @@ fn scan_installers(env: &Env) -> Vec<Item> {
         } else {
             None
         };
-        let intel_on_arm = cfg!(target_arch = "aarch64") && is_intel_build(&name.to_lowercase());
+        let intel_on_arm =
+            env.os == Os::Mac && cfg!(target_arch = "aarch64") && is_intel_build(&name.to_lowercase());
 
         let (mut detail, safety) = if let Some(app) = &installed {
             (format!("{app} is installed"), Safety::Safe)
@@ -1068,7 +1168,7 @@ fn strip_extensions(file_name: &str) -> String {
     }
 }
 
-fn normalize(name: &str) -> String {
+pub(crate) fn normalize(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
@@ -1112,36 +1212,12 @@ fn scan_docker(env: &Env) -> Vec<Item> {
     if bytes < env.min_bytes {
         return Vec::new();
     }
-    let running = env.check_processes && docker_running();
+    let running = env.check_processes && docker_running(env.os);
     let bin = [PathBuf::from("/Applications/Docker.app/Contents/Resources/bin/docker")]
         .into_iter()
         .find(|p| p.is_file())
         .or_else(|| env.find_bin("docker"));
-
-    let mut prune = Item::deletable(
-        "docker",
-        "Unused images and build cache",
-        "Runs `docker system prune -a`. Keeps volumes",
-        vec![disk.clone()],
-        bytes,
-        Safety::Review,
-    );
-    prune.id = "docker:prune".to_string();
-    prune.approx = true;
-    prune.preselect = false;
-    match (&bin, running) {
-        (Some(bin), true) => prune.action = Action::DockerPrune { bin: bin.clone() },
-        (Some(_), false) => {
-            prune.enabled = false;
-            prune.action = Action::Nothing;
-            prune.detail.push_str(" · open Docker Desktop first");
-        }
-        (None, _) => {
-            prune.enabled = false;
-            prune.action = Action::Nothing;
-            prune.detail.push_str(" · docker not found");
-        }
-    }
+    let prune = docker_prune(&disk, bytes, bin, running);
 
     let mut wipe = Item::deletable(
         "docker",
@@ -1161,12 +1237,49 @@ fn scan_docker(env: &Env) -> Vec<Item> {
     vec![prune, wipe]
 }
 
-pub fn docker_running() -> bool {
-    Command::new("/usr/bin/pgrep")
-        .args(["-f", "com.docker.backend|Docker Desktop.app/Contents/MacOS"])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+/// Frees space inside Docker's disk image with `docker system prune`. Needs
+/// Docker running.
+fn docker_prune(disk: &Path, bytes: u64, bin: Option<PathBuf>, running: bool) -> Item {
+    let mut prune = Item::deletable(
+        "docker",
+        "Unused images and build cache",
+        "Runs `docker system prune -a`. Keeps volumes",
+        vec![disk.to_path_buf()],
+        bytes,
+        Safety::Review,
+    );
+    prune.id = "docker:prune".to_string();
+    prune.approx = true;
+    prune.preselect = false;
+    match (bin, running) {
+        (Some(bin), true) => prune.action = Action::DockerPrune { bin },
+        (Some(_), false) => {
+            prune.enabled = false;
+            prune.action = Action::Nothing;
+            prune.detail.push_str(" · open Docker Desktop first");
+        }
+        (None, _) => {
+            prune.enabled = false;
+            prune.action = Action::Nothing;
+            prune.detail.push_str(" · docker not found");
+        }
+    }
+    prune
+}
+
+pub fn docker_running(os: Os) -> bool {
+    match os {
+        Os::Mac => command("/usr/bin/pgrep")
+            .args(["-f", "com.docker.backend|Docker Desktop.app/Contents/MacOS"])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false),
+        Os::Windows => command("tasklist")
+            .args(["/FI", "IMAGENAME eq com.docker.backend.exe", "/NH"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).to_lowercase().contains("com.docker.backend.exe"))
+            .unwrap_or(false),
+    }
 }
 
 // --------------------------------------------------------------- manual
@@ -1220,6 +1333,20 @@ fn scan_manual(env: &Env) -> Vec<Item> {
 }
 
 // -------------------------------------------------------------- helpers
+
+/// Entries of `dir` not changed since `cutoff`. A folder counts as changed
+/// when anything near its top changed.
+pub(crate) fn old_entries(dir: &Path, cutoff: i64) -> Vec<PathBuf> {
+    children(dir)
+        .into_iter()
+        .filter(|path| {
+            let Ok(meta) = fs::symlink_metadata(path) else { return false };
+            let own = crate::sizes::mtime(&meta);
+            let inner = if meta.is_dir() { newest_file_mtime(path, 2, &|_| false) } else { None };
+            own.max(inner).is_some_and(|t| t < cutoff)
+        })
+        .collect()
+}
 
 fn name_of(path: &Path) -> String {
     path.file_name()

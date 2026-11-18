@@ -1,7 +1,7 @@
 [package]
 name = "sweep"
 version = "0.1.4"
-description = "Find and clean up files your Mac doesn't need"
+description = "Find and clean up files your computer doesn't need"
 license = "MIT"
 repository = "https://github.com/arifurrahmanns/sweep"
 edition = "2021"
@@ -19,7 +19,12 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1"
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
 
 [dev-dependencies]
 tempfile = "3"

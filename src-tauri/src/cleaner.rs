@@ -1,14 +1,13 @@
 //! Deletes what a scan found, and nothing else.
 
 use crate::disk::{disk_info, DiskInfo};
-use crate::scanner::{docker_running, Action, Env, Item};
+use crate::os::{command, Os};
+use crate::scanner::{docker_running, old_entries, Action, Env, Item};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -93,26 +92,41 @@ fn clean_item(env: &Env, item: &Item) -> Outcome {
     match &item.action {
         Action::Remove(paths) => {
             for path in paths {
-                if let Err(why) = check_target(&env.home, path) {
+                if let Err(why) = check_target_on(env.os, &env.home, path) {
                     return fail(out, why);
                 }
             }
-            let stats = RemoveStats::default();
+            let stats = RemoveStats::new(env.os);
             for path in paths {
                 remove_tree(path, &stats);
             }
             stats.describe(&mut out, &paths[0]);
         }
         Action::DockerWipe { disk } => {
-            if env.check_processes && docker_running() {
+            if env.check_processes && docker_running(env.os) {
                 return fail(out, "Docker is running. Quit Docker Desktop first.".to_string());
             }
-            if let Err(why) = check_target(&env.home, disk) {
+            if let Err(why) = check_target_on(env.os, &env.home, disk) {
                 return fail(out, why);
             }
-            let stats = RemoveStats::default();
+            let stats = RemoveStats::new(env.os);
             remove_tree(disk, &stats);
             stats.describe(&mut out, disk);
+        }
+        Action::EmptyFolder { dir, older_than } => {
+            let entries = old_entries(dir, *older_than);
+            for path in &entries {
+                if let Err(why) = check_target_on(env.os, &env.home, path) {
+                    return fail(out, why);
+                }
+            }
+            let stats = RemoveStats::new(env.os);
+            entries.par_iter().for_each(|path| remove_tree(path, &stats));
+            // Files still in use are expected here; skip them quietly.
+            let skipped = stats.failed.load(Ordering::Relaxed);
+            if skipped > 0 {
+                out.message = Some(format!("Skipped {skipped} files in use."));
+            }
         }
         Action::PnpmPrune { bin, store } => {
             // Point pnpm at the store; on its own it may pick one next to
@@ -127,7 +141,7 @@ fn clean_item(env: &Env, item: &Item) -> Outcome {
 }
 
 /// Folders Sweep must never delete, relative to the home folder.
-const PROTECTED: &[&str] = &[
+const PROTECTED_MAC: &[&str] = &[
     "Library",
     "Library/Caches",
     "Library/Application Support",
@@ -151,7 +165,7 @@ const PROTECTED: &[&str] = &[
 ];
 
 /// Folders Sweep must never delete anything inside.
-const OFF_LIMITS: &[&str] = &[
+const OFF_LIMITS_MAC: &[&str] = &[
     ".ssh",
     ".gnupg",
     "Library/Keychains",
@@ -162,9 +176,61 @@ const OFF_LIMITS: &[&str] = &[
     "Pictures/Photos Library.photoslibrary",
 ];
 
+const PROTECTED_WINDOWS: &[&str] = &[
+    "AppData",
+    "AppData/Local",
+    "AppData/LocalLow",
+    "AppData/Roaming",
+    "AppData/Local/Temp",
+    "AppData/Local/Programs",
+    "AppData/Local/Microsoft",
+    "AppData/Roaming/Microsoft",
+    "AppData/Local/Google",
+    "AppData/Local/Mozilla",
+    "AppData/Roaming/Mozilla",
+    "Desktop",
+    "Documents",
+    "Downloads",
+    "Pictures",
+    "Videos",
+    "Music",
+    "OneDrive",
+    "Favorites",
+    "Contacts",
+    "Links",
+    "Saved Games",
+    "Searches",
+    ".config",
+    ".local",
+    ".cache",
+];
+
+const OFF_LIMITS_WINDOWS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    "AppData/Local/Packages",
+    "AppData/Local/Microsoft/Windows",
+    "AppData/Roaming/Microsoft/Windows",
+    "AppData/Local/Microsoft/Credentials",
+    "AppData/Roaming/Microsoft/Credentials",
+    "AppData/Roaming/Microsoft/Protect",
+    "AppData/Roaming/Microsoft/Crypto",
+    "AppData/Roaming/Microsoft/SystemCertificates",
+    "AppData/Local/Microsoft/Vault",
+    "AppData/Roaming/Microsoft/Vault",
+    "AppData/Roaming/Apple Computer/MobileSync",
+    "Apple/MobileSync",
+];
+
 /// Last line of defence before deleting: the path must sit inside the home
 /// folder and must not be, or be inside, anything important.
 pub fn check_target(home: &Path, path: &Path) -> Result<(), String> {
+    check_target_on(Os::current(), home, path)
+}
+
+/// `check_target` for a given system's folder layout. Windows compares names
+/// without regard to case, as Windows itself does.
+pub fn check_target_on(os: Os, home: &Path, path: &Path) -> Result<(), String> {
     let refuse = |why: &str| Err(format!("Refused to delete {}: {why}.", path.display()));
     if !path.is_absolute()
         || path
@@ -179,10 +245,19 @@ pub fn check_target(home: &Path, path: &Path) -> Result<(), String> {
     if rel.as_os_str().is_empty() {
         return refuse("it's your home folder");
     }
-    if PROTECTED.iter().any(|p| rel == Path::new(p)) {
+    let (protected, off_limits) = match os {
+        Os::Mac => (PROTECTED_MAC, OFF_LIMITS_MAC),
+        Os::Windows => (PROTECTED_WINDOWS, OFF_LIMITS_WINDOWS),
+    };
+    let key = |text: &str| if os == Os::Windows { text.to_lowercase() } else { text.to_string() };
+    let rel_key = key(&rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"));
+    if protected.iter().any(|p| rel_key == key(p)) {
         return refuse("it's a protected folder");
     }
-    if OFF_LIMITS.iter().any(|p| rel.starts_with(p)) {
+    if off_limits.iter().any(|p| {
+        let p = key(p);
+        rel_key == p || rel_key.starts_with(&format!("{p}/"))
+    }) {
         return refuse("it holds personal data");
     }
     // A symlinked parent could point somewhere else entirely.
@@ -197,23 +272,45 @@ pub fn check_target(home: &Path, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Default)]
 struct RemoveStats {
+    os: Os,
     failed: AtomicUsize,
     /// Failures because the file or its folder belongs to another user.
     not_owned: AtomicUsize,
-    /// Failures because macOS blocked access to our own files.
+    /// Failures because the system blocked access to our own files.
     blocked: AtomicUsize,
     first_error: Mutex<Option<String>>,
 }
 
+/// Whether a file belongs to another user, such as root after an old `sudo`.
+#[cfg(unix)]
+fn owned_by_someone_else(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid can't fail.
+    let uid = unsafe { libc::getuid() };
+    fs::symlink_metadata(path).map(|m| m.uid() != uid).unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn owned_by_someone_else(_path: &Path) -> bool {
+    false
+}
+
 impl RemoveStats {
+    fn new(os: Os) -> RemoveStats {
+        RemoveStats {
+            os,
+            failed: AtomicUsize::new(0),
+            not_owned: AtomicUsize::new(0),
+            blocked: AtomicUsize::new(0),
+            first_error: Mutex::new(None),
+        }
+    }
+
     fn record(&self, path: &Path, err: &io::Error) {
         self.failed.fetch_add(1, Ordering::Relaxed);
         if err.kind() == ErrorKind::PermissionDenied {
-            let uid = unsafe { libc::getuid() };
-            let owned = |p: &Path| fs::symlink_metadata(p).map(|m| m.uid() == uid).unwrap_or(true);
-            if !owned(path) || path.parent().is_some_and(|p| !owned(p)) {
+            if owned_by_someone_else(path) || path.parent().is_some_and(owned_by_someone_else) {
                 self.not_owned.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.blocked.fetch_add(1, Ordering::Relaxed);
@@ -238,7 +335,10 @@ impl RemoveStats {
         out.hint = if out.needs_admin {
             Some("They're owned by the system (root), usually from an old sudo command.".to_string())
         } else if self.blocked.load(Ordering::Relaxed) > 0 {
-            Some("macOS blocked access. Quit the app using these files, or give Sweep Full Disk Access.".to_string())
+            Some(match self.os {
+                Os::Mac => "macOS blocked access. Quit the app using these files, or give Sweep Full Disk Access.",
+                Os::Windows => "Windows blocked access. Close the app using these files, then try again.",
+            }.to_string())
         } else {
             self.first_error.lock().unwrap().clone()
         };
@@ -261,15 +361,49 @@ fn remove_tree(path: &Path, stats: &RemoveStats) {
             }
             Err(err) => return stats.record(path, &err),
         }
-        if let Err(err) = fs::remove_dir(path) {
+        if let Err(err) = writable_retry(path, &meta, |p| fs::remove_dir(p)) {
             // A folder that still has files in it was already reported above.
             if !matches!(err.kind(), ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty) {
                 stats.record(path, &err);
             }
         }
-    } else if let Err(err) = fs::remove_file(path) {
+    } else if let Err(err) = remove_entry(path, &meta) {
         if err.kind() != ErrorKind::NotFound {
             stats.record(path, &err);
+        }
+    }
+}
+
+/// Deletes a file or a link. On Windows a link to a folder, including the
+/// junctions pnpm makes, is deleted as a folder: just the link, never what it
+/// points to.
+fn remove_entry(path: &Path, meta: &fs::Metadata) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if meta.file_type().is_symlink_dir() {
+            return fs::remove_dir(path);
+        }
+    }
+    writable_retry(path, meta, |p| fs::remove_file(p))
+}
+
+/// Runs a delete. On Windows, files marked read-only (common in `.git` and
+/// `node_modules`) refuse to be deleted, so the flag is cleared and the delete
+/// tried once more.
+fn writable_retry(path: &Path, meta: &fs::Metadata, delete: impl Fn(&Path) -> io::Result<()>) -> io::Result<()> {
+    match delete(path) {
+        #[cfg(windows)]
+        Err(err) if err.kind() == ErrorKind::PermissionDenied && meta.permissions().readonly() => {
+            let mut permissions = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)] // Windows: only clears the read-only flag
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions).map_err(|_| err)?;
+            delete(path)
+        }
+        result => {
+            let _ = meta;
+            result
         }
     }
 }
@@ -283,7 +417,7 @@ fn run_tool(env: &Env, bin: &Path, args: &[&str], out: &mut Outcome) {
             .map(str::to_string)
     };
     // Apps opened from Finder start in "/", which is read-only.
-    let result = Command::new(bin)
+    let result = command(bin)
         .args(args)
         .current_dir(&env.home)
         .env("PATH", env.search_path())
@@ -307,14 +441,16 @@ fn run_tool(env: &Env, bin: &Path, args: &[&str], out: &mut Outcome) {
 /// standard macOS admin password prompt. An ordinary app can't delete files
 /// that an old `sudo` left owned by root; after this it can.
 pub fn take_ownership(env: &Env, item: &Item) -> Result<(), String> {
+    if env.os != Os::Mac {
+        return Err("This fix is only for macOS.".to_string());
+    }
     let Action::Remove(paths) = &item.action else {
         return Err("This item can't be fixed this way.".to_string());
     };
     for path in paths {
-        check_target(&env.home, path)?;
+        check_target_on(env.os, &env.home, path)?;
     }
-    // SAFETY: getuid and getgid can't fail.
-    let owner = unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) };
+    let owner = current_owner();
     // Paths are passed as arguments, never pasted into the script.
     let script = [
         "on run argv",
@@ -325,7 +461,7 @@ pub fn take_ownership(env: &Env, item: &Item) -> Result<(), String> {
         "do shell script \"/usr/sbin/chown -R \" & item 1 of argv & targets with prompt \"Sweep needs your password to delete files owned by the system.\" with administrator privileges",
         "end run",
     ];
-    let output = Command::new("/usr/bin/osascript")
+    let output = command("/usr/bin/osascript")
         .args(script.iter().flat_map(|line| ["-e", *line]))
         .arg(&owner)
         .args(paths)
@@ -340,4 +476,16 @@ pub fn take_ownership(env: &Env, item: &Item) -> Result<(), String> {
     } else {
         Err(error.trim().to_string())
     }
+}
+
+/// "uid:gid" of the user running Sweep.
+#[cfg(unix)]
+fn current_owner() -> String {
+    // SAFETY: getuid and getgid can't fail.
+    unsafe { format!("{}:{}", libc::getuid(), libc::getgid()) }
+}
+
+#[cfg(not(unix))]
+fn current_owner() -> String {
+    String::new()
 }

@@ -5,9 +5,6 @@ const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
 const listen = (event, handler) => tauri.event.listen(event, handler);
 const $ = (id) => document.getElementById(id);
 
-// Inside the app the window draws a translucent sidebar behind the page.
-if (window.__TAURI_INTERNALS__) document.documentElement.classList.add('native');
-
 const SETTINGS_KEY = 'sweep.settings.v1';
 const DAY = 86400;
 const GAUGE_LENGTH = 2 * Math.PI * 86;
@@ -49,6 +46,8 @@ const APP_ICON =
   '<path d="M512 392 L543 481 L632 512 L543 543 L512 632 L481 543 L392 512 L481 481 Z" fill="#fff"/></svg>';
 
 const state = {
+  /** "macos" or "windows", from the backend. */
+  platform: 'macos',
   home: '',
   disk: null,
   result: null,
@@ -130,10 +129,20 @@ function rich(text) {
   return esc(text).replace(/`([^`]+)`/g, '<code>$1</code>');
 }
 
+const isWindows = () => state.platform === 'windows';
+const fileManager = () => (isWindows() ? 'File Explorer' : 'Finder');
+
+/** Whether `path` is the home folder or inside it. Windows ignores case. */
+function inHome(path) {
+  if (!state.home) return false;
+  const sep = isWindows() ? '\\' : '/';
+  const [p, h] = isWindows() ? [path.toLowerCase(), state.home.toLowerCase()] : [path, state.home];
+  return p === h || p.startsWith(h + sep);
+}
+
 function tilde(path) {
-  if (!state.home) return path;
-  if (path === state.home) return '~';
-  return path.startsWith(state.home + '/') ? '~' + path.slice(state.home.length) : path;
+  if (!inHome(path)) return path;
+  return path.length === state.home.length ? '~' : '~' + path.slice(state.home.length);
 }
 
 function listText(names) {
@@ -248,6 +257,13 @@ function renderSkipped() {
     : `<button class="side-note" data-fda type="button" title="Skipped ${names}. Allow Full Disk Access to include them.">${icon('lock')}<span>${plural(skipped.length, 'folder')} skipped</span><strong>Allow</strong></button>`;
 }
 
+/** Total size for the sidebar; blank when nothing in it could be measured. */
+function categorySize(items) {
+  const bytes = uniqueBytes(items);
+  if (!items.length || (bytes === 0 && items.some((i) => i.sizeUnknown))) return '';
+  return formatBytes(bytes);
+}
+
 function renderNav() {
   $('catList').innerHTML = state.result.categories
     .map((cat) => {
@@ -255,7 +271,7 @@ function renderNav() {
       const classes = ['cat', cat.id === state.active ? 'active' : '', cat.items.length ? '' : 'empty'].join(' ');
       const size = chosen.length
         ? `<span class="cat-size selected" title="Selected">${formatBytes(uniqueBytes(chosen))}</span>`
-        : `<span class="cat-size">${cat.items.length ? formatBytes(uniqueBytes(cat.items)) : ''}</span>`;
+        : `<span class="cat-size">${categorySize(cat.items)}</span>`;
       return `<button class="${classes}" data-cat="${esc(cat.id)}" type="button">
           <span class="cat-icon tint-${esc(cat.id)}">${icon(CATEGORY_ICONS[cat.id] || 'dot')}</span>
           <span class="cat-title">${esc(cat.title)}</span>${size}
@@ -302,7 +318,7 @@ function sectionHtml(group, items, n) {
   const last = Math.max(0, ...items.map((i) => i.lastUsed || 0));
   const title = group ? esc(group) : plural(items.length, 'item');
   const meta = group && last ? `changed ${ago(last)}` : '';
-  const head = `<span class="group-title">${title}</span><span class="group-meta">${meta}</span><span class="group-size">${formatBytes(uniqueBytes(items))}</span>`;
+  const head = `<span class="group-title">${title}</span><span class="group-meta">${meta}</span><span class="group-size">${categorySize(items)}</span>`;
 
   let header;
   if (candidates.length) {
@@ -327,7 +343,7 @@ function rowHtml(item) {
         <div class="row-title"><span class="name">${esc(item.title)}</span>${badge}</div>
         ${item.detail ? `<div class="row-detail">${rich(item.detail)}</div>` : ''}
       </div>
-      <button class="tool reveal" data-reveal="${esc(item.id)}" title="Show in Finder" aria-label="Show ${esc(item.title)} in Finder" type="button">${icon('search')}</button>
+      <button class="tool reveal" data-reveal="${esc(item.id)}" title="Show in ${fileManager()}" aria-label="Show ${esc(item.title)} in ${fileManager()}" type="button">${icon('search')}</button>
       <div class="row-size">${sizeText(item)}</div>
     </div>`;
 }
@@ -660,7 +676,7 @@ function openSettings() {
     $('addRoot').addEventListener('click', async () => {
       try {
         const picked = await pickFolders();
-        const inside = picked.filter((p) => p === state.home || p.startsWith(state.home + '/'));
+        const inside = picked.filter(inHome);
         for (const p of inside) if (!state.settings.roots.includes(p)) state.settings.roots.push(p);
         saveSettings();
         error = inside.length < picked.length ? 'Only folders inside your home folder work.' : '';
@@ -697,7 +713,7 @@ $('catList').addEventListener('click', (e) => {
 $('catView').addEventListener('click', (e) => {
   const reveal = e.target.closest('[data-reveal]');
   if (reveal) {
-    invoke('reveal', { id: reveal.dataset.reveal }).catch((err) => showError("Couldn't show in Finder", err));
+    invoke('reveal', { id: reveal.dataset.reveal }).catch((err) => showError(`Couldn't show in ${fileManager()}`, err));
     return;
   }
   const row = e.target.closest('.row');
@@ -747,6 +763,7 @@ document.addEventListener('click', (e) => {
 });
 
 // Keyboard: ⌘R scan, ⌘, settings, ⌘A select all, ⌘⌫ clean up, ↑↓ categories.
+// On Windows, Ctrl instead of ⌘, and Delete also cleans up.
 document.addEventListener('keydown', (e) => {
   const mod = e.metaKey || e.ctrlKey;
   if (!$('modal').hidden) {
@@ -771,7 +788,7 @@ document.addEventListener('keydown', (e) => {
   if (mod && e.code === 'KeyA') {
     e.preventDefault();
     toggleAll(activeCategory().items);
-  } else if (mod && e.key === 'Backspace') {
+  } else if ((mod && e.key === 'Backspace') || (isWindows() && !mod && e.key === 'Delete')) {
     e.preventDefault();
     openConfirm();
   } else if (!mod && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
@@ -795,9 +812,10 @@ window.addEventListener('focus', async () => {
 
 // --------------------------------------------------------- native app feel
 
-// Behave like a Mac app, not a web page: no right-click menu (Reload,
+// Behave like an app, not a web page: no right-click menu (Reload,
 // Inspect Element, Look Up), no dragging bits of the page around, and no
-// browser shortcuts for reload, print, find, save, zoom or the inspector.
+// browser shortcuts for reload, print, find, save, zoom, back or the
+// inspector. Windows' WebView2 has a few more of these than macOS.
 const BROWSER_SHORTCUTS = new Set(['KeyR', 'KeyP', 'KeyF', 'KeyG', 'KeyS', 'KeyU', 'KeyO', 'Equal', 'Minus', 'Digit0', 'NumpadAdd', 'NumpadSubtract', 'Numpad0']);
 const INSPECTOR_SHORTCUTS = new Set(['KeyI', 'KeyJ', 'KeyC']);
 
@@ -808,7 +826,8 @@ document.addEventListener(
   (e) => {
     const mod = e.metaKey || e.ctrlKey;
     if (
-      ['F5', 'F7', 'F12'].includes(e.key) ||
+      ['F3', 'F5', 'F7', 'F12', 'BrowserBack', 'BrowserForward', 'BrowserRefresh'].includes(e.key) ||
+      (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) ||
       (mod && BROWSER_SHORTCUTS.has(e.code)) ||
       (mod && (e.altKey || e.shiftKey) && INSPECTOR_SHORTCUTS.has(e.code))
     ) {
@@ -817,8 +836,34 @@ document.addEventListener(
   },
   true,
 );
+// Ctrl + mouse wheel zooms the page in WebView2.
+document.addEventListener(
+  'wheel',
+  (e) => {
+    if (e.ctrlKey) e.preventDefault();
+  },
+  { passive: false },
+);
+// The mouse's back and forward buttons would navigate away.
+document.addEventListener('mouseup', (e) => {
+  if (e.button === 3 || e.button === 4) e.preventDefault();
+});
 
 // -------------------------------------------------------------------- init
+
+/** Matches the window to the system: shortcut names, title bar, sidebar. */
+function applyPlatform() {
+  const root = document.documentElement;
+  root.classList.toggle('windows', isWindows());
+  root.classList.toggle('mac', !isWindows());
+  // On macOS the window draws a translucent sidebar behind the page.
+  root.classList.toggle('native', !isWindows() && Boolean(window.__TAURI_INTERNALS__));
+  const mod = isWindows() ? 'Ctrl+' : '⌘';
+  $('rescanBtn').title = `Scan Again (${mod}R)`;
+  document.querySelectorAll('[data-settings]').forEach((button) => {
+    button.title = `Settings (${mod},)`;
+  });
+}
 
 async function init() {
   document.querySelectorAll('[data-settings]').forEach((button) => {
@@ -827,12 +872,14 @@ async function init() {
   $('rescanBtn').innerHTML = icon('refresh');
   try {
     const overview = await invoke('overview');
+    state.platform = overview.platform === 'windows' ? 'windows' : 'macos';
     state.home = overview.home;
     state.disk = overview.disk;
     state.fullDiskAccess = overview.fullDiskAccess;
   } catch {
     // The disk numbers just stay empty.
   }
+  applyPlatform();
   renderStart();
   renderDisk();
 }

@@ -1,11 +1,13 @@
-//! Sweep: finds files your Mac doesn't need and deletes the ones you pick.
+//! Sweep: finds files your computer doesn't need and deletes the ones you pick.
 
 pub mod cleaner;
 pub mod disk;
+pub mod os;
 pub mod registry;
 pub mod scanner;
 pub mod sizes;
 
+use os::Os;
 use scanner::{Env, Item, ScanOptions, ScanResult};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -27,6 +29,8 @@ struct Overview {
     home: String,
     disk: disk::DiskInfo,
     full_disk_access: bool,
+    /// "macos" or "windows", so the window can match the system.
+    platform: &'static str,
 }
 
 #[tauri::command]
@@ -36,6 +40,7 @@ fn overview() -> Overview {
         home: env.home.display().to_string(),
         disk: disk::disk_info(),
         full_disk_access: env.full_disk_access,
+        platform: env.os.name(),
     }
 }
 
@@ -108,7 +113,7 @@ async fn fix_and_clean(app: AppHandle, state: State<'_, AppState>, id: String) -
     Ok(report)
 }
 
-/// Shows an item in Finder.
+/// Shows an item in Finder or File Explorer.
 #[tauri::command]
 fn reveal(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let path = {
@@ -118,17 +123,27 @@ fn reveal(state: State<'_, AppState>, id: String) -> Result<(), String> {
             .and_then(|item| item.paths.iter().find(|p| Path::new(p).exists()).cloned())
     }
     .ok_or("This is no longer on disk.")?;
-    Command::new("/usr/bin/open")
-        .arg("-R")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    let mut show = match Os::current() {
+        Os::Mac => {
+            let mut cmd = Command::new("/usr/bin/open");
+            cmd.arg("-R");
+            cmd
+        }
+        Os::Windows => {
+            let mut cmd = Command::new("explorer");
+            cmd.arg("/select,");
+            cmd
+        }
+    };
+    show.arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Opens System Settings at Privacy & Security → Full Disk Access.
 #[tauri::command]
 fn open_full_disk_access() -> Result<(), String> {
+    if Os::current() != Os::Mac {
+        return Err("Full Disk Access is a macOS setting.".to_string());
+    }
     Command::new("/usr/bin/open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
         .spawn()
